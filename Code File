@@ -1,0 +1,647 @@
+Nice — ambitious and awesome. I’ll give you a practical, end-to-end plan plus working, object-oriented code samples you can run and extend. This includes:
+
+* architecture & components for an **Agentic AI-driven, multi-tenant SaaS e-commerce** for electronics
+* step-by-step procedure to build, test, and deploy
+* concrete **OOP backend** (FastAPI + SQLAlchemy) with product, user, order, tenant models and APIs
+* **Agentic AI** orchestrator code (how agents act, retrieve knowledge, and execute tasks)
+* **React + Tailwind** frontend snippets (product catalog, cart, responsive layout, agent chat UI)
+* Docker / env / deployment pointers, multi-tenant notes, security and billing integration (Stripe), and extension ideas
+
+I can’t deliver a full multi-file repo in a single chat message, but below I provide runnable, well-structured code you can copy/paste and iterate on immediately. I’ll mark files and explain where each fits. Let’s dive in.
+
+# 1 — High-level architecture (what you’ll build)
+
+A modern SaaS e-commerce for electronics with agentic AI features:
+
+* **Frontend (React + Tailwind)** — customer storefront, admin dashboard, agent chat UI (AI assistant that can recommend products, analyze inventory, place orders, run marketing tasks). Mobile-first, responsive.
+* **Backend (FastAPI, OOP)** — REST + WebSocket APIs, authentication (JWT), multi-tenant routing, product & order domain models (SQLAlchemy), business services (OOP service classes), background worker (Celery/Redis for long-running agent actions).
+* **DB** — PostgreSQL (multi-tenant by `tenant_id` column or schema-per-tenant depending on scale).
+* **Search & Vector DB** — Elasticsearch / OpenSearch for product search; a vector DB (Milvus/Pinecone/FAISS) for semantic retrieval for RAG (recommendation/explanation).
+* **Agentic AI Layer** — orchestrator (AgentManager) that composes actions: gather context (user profile, cart, recent purchases), call LLM for planning and reasoning, call tools (search, inventory query, payment API), and return actionable results. Use RAG (retrieval augmented generation) + tool calls + constrained executors.
+* **Payments** — Stripe for payments/subscriptions.
+* **Auth & Billing** — JWT, role-based access (customer/admin), tenant owner billing.
+* **Hosting** — Docker → Kubernetes (GKE/EKS) or simpler: Docker Compose + a VPS; CI/CD via GitHub Actions.
+
+# 2 — Key design principles
+
+* OOP domain model: `User`, `Tenant`, `Product`, `Inventory`, `Order`, `Cart`, `AgentTask`.
+* Separation of concerns: models → repositories → services → controllers (APIs).
+* Agentic layer as separate service with well-defined tool adapters (SearchTool, PaymentTool, InventoryTool).
+* Use environment variables for secrets; never hardcode keys.
+* Telemetry & observability for agent decisions (logs + audit trail).
+* Security: input validation, rate limiting, TLS, CSRF (frontend + cookie options), least privilege for services.
+
+---
+
+# 3 — Backend — Minimal but functioning example (FastAPI + SQLAlchemy, OOP)
+
+Files:
+
+* `backend/app/main.py` (entry)
+* `backend/app/core/config.py` (env)
+* `backend/app/db/session.py`
+* `backend/app/models/*.py` (OOP SQLAlchemy models)
+* `backend/app/schemas/*.py` (Pydantic)
+* `backend/app/repositories/*.py` (DB access classes)
+* `backend/app/services/*.py` (business logic OOP classes)
+* `backend/app/api/*.py` (routers)
+* `backend/app/agents/agent_manager.py` (agentic orchestrator)
+
+I'll show the core files — enough to run a minimal system with product listing, cart, order placement, and an agent endpoint that can take instructions and perform actions (recommendations, add-to-cart). The agent uses an LLM provider (pseudocode for OpenAI/other).
+
+> Prereqs: Python 3.11+, PostgreSQL, Redis (optional for background jobs). Install: `pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic python-dotenv httpx jose[cryptography]`
+
+---
+
+## `backend/app/core/config.py`
+
+```python
+# config.py
+from pydantic import BaseSettings
+
+class Settings(BaseSettings):
+    DATABASE_URL: str = "postgresql+psycopg2://postgres:password@localhost:5432/ecom"
+    SECRET_KEY: str = "replace-this-with-secure-random"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
+    OPENAI_API_KEY: str | None = None
+    STRIPE_SECRET_KEY: str | None = None
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+```
+
+---
+
+## `backend/app/db/session.py`
+
+```python
+# session.py
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, scoped_session, declarative_base
+from app.core.config import settings
+
+engine = create_engine(settings.DATABASE_URL, future=True, echo=False)
+SessionLocal = scoped_session(sessionmaker(bind=engine, autoflush=False, autocommit=False))
+Base = declarative_base()
+```
+
+---
+
+## `backend/app/models/user.py`
+
+```python
+# models/user.py
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey
+from sqlalchemy.orm import relationship
+from app.db.session import Base
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True)
+    is_admin = Column(Boolean, default=False)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    tenant = relationship("Tenant", back_populates="users")
+```
+
+## `backend/app/models/tenant.py`
+
+```python
+# models/tenant.py
+from sqlalchemy import Column, Integer, String
+from sqlalchemy.orm import relationship
+from app.db.session import Base
+
+class Tenant(Base):
+    __tablename__ = "tenants"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, nullable=False)
+    users = relationship("User", back_populates="tenant")
+```
+
+## `backend/app/models/product.py`
+
+```python
+# models/product.py
+from sqlalchemy import Column, Integer, String, Text, Float, Boolean, ForeignKey
+from sqlalchemy.orm import relationship
+from app.db.session import Base
+
+class Product(Base):
+    __tablename__ = "products"
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)   # multi-tenant
+    sku = Column(String, index=True, unique=True)
+    name = Column(String, index=True)
+    description = Column(Text)
+    price = Column(Float)
+    quantity = Column(Integer, default=0)
+    active = Column(Boolean, default=True)
+```
+
+## `backend/app/models/order.py`
+
+```python
+# models/order.py
+from sqlalchemy import Column, Integer, String, ForeignKey, Float
+from sqlalchemy.orm import relationship
+from app.db.session import Base
+
+class Order(Base):
+    __tablename__ = "orders"
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    total_amount = Column(Float)
+    status = Column(String, default="created")
+    # For brevity, not modeling order items table here; in production create OrderItem model
+```
+
+---
+
+## `backend/app/schemas/product.py`
+
+```python
+# schemas/product.py
+from pydantic import BaseModel
+
+class ProductCreate(BaseModel):
+    sku: str
+    name: str
+    description: str | None = None
+    price: float
+    quantity: int = 0
+
+class ProductRead(BaseModel):
+    id: int
+    sku: str
+    name: str
+    description: str | None
+    price: float
+    quantity: int
+
+    class Config:
+        orm_mode = True
+```
+
+---
+
+## `backend/app/repositories/product_repo.py`
+
+```python
+# product_repo.py
+from sqlalchemy.orm import Session
+from app.models.product import Product
+from app.schemas.product import ProductCreate
+
+class ProductRepository:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def create(self, tenant_id: int, payload: ProductCreate) -> Product:
+        product = Product(**payload.dict(), tenant_id=tenant_id)
+        self.db.add(product)
+        self.db.commit()
+        self.db.refresh(product)
+        return product
+
+    def list_by_tenant(self, tenant_id: int, limit: int = 50, skip: int = 0):
+        return self.db.query(Product).filter_by(tenant_id=tenant_id, active=True).offset(skip).limit(limit).all()
+
+    def get(self, tenant_id: int, product_id: int):
+        return self.db.query(Product).filter_by(tenant_id=tenant_id, id=product_id).first()
+
+    def update_quantity(self, tenant_id: int, product_id: int, delta: int) -> Product:
+        p = self.get(tenant_id, product_id)
+        if not p:
+            return None
+        p.quantity += delta
+        self.db.commit()
+        self.db.refresh(p)
+        return p
+```
+
+---
+
+## `backend/app/services/product_service.py`
+
+```python
+# product_service.py
+from app.repositories.product_repo import ProductRepository
+from sqlalchemy.orm import Session
+from app.schemas.product import ProductCreate
+
+class ProductService:
+    def __init__(self, db: Session):
+        self.repo = ProductRepository(db)
+
+    def create_product(self, tenant_id: int, payload: ProductCreate):
+        # Add domain validations here (sku format, price > 0)
+        return self.repo.create(tenant_id, payload)
+
+    def list_products(self, tenant_id: int, limit=50, skip=0):
+        return self.repo.list_by_tenant(tenant_id, limit, skip)
+```
+
+---
+
+## `backend/app/api/products.py`
+
+```python
+# products router
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from app.db.session import SessionLocal
+from app.services.product_service import ProductService
+from app.schemas.product import ProductCreate, ProductRead
+from typing import List
+
+router = APIRouter(prefix="/products", tags=["products"])
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# For demo, tenant_id fetched from header X-Tenant-Id (in prod use auth & tenant middleware)
+def get_tenant_id(x_tenant_id: int = None):
+    if x_tenant_id is None:
+        raise HTTPException(status_code=400, detail="Missing tenant header")
+    return x_tenant_id
+
+@router.post("/", response_model=ProductRead)
+def create_product(payload: ProductCreate, db: Session = Depends(get_db), tenant_id: int = Depends(get_tenant_id)):
+    svc = ProductService(db)
+    return svc.create_product(tenant_id, payload)
+
+@router.get("/", response_model=List[ProductRead])
+def list_products(db: Session = Depends(get_db), tenant_id: int = Depends(get_tenant_id)):
+    svc = ProductService(db)
+    return svc.list_products(tenant_id)
+```
+
+---
+
+## `backend/app/agents/agent_manager.py` — core of agentic AI
+
+This is a simplified agent orchestrator that accepts instructions, gets context (user, cart), calls an LLM to produce a plan (JSON), maps plan steps to tools (search, cart update, checkout), executes and returns results. In production, use a robust agent framework (LangChain Agents or custom orchestrator with safety checks).
+
+```python
+# agent_manager.py
+import os
+import httpx
+from typing import Any, Dict, List
+from app.db.session import SessionLocal
+from app.models.user import User
+from app.models.product import Product
+from app.repositories.product_repo import ProductRepository
+from app.core.config import settings
+import json
+
+class ToolResponse:
+    def __init__(self, success: bool, data: Any = None, message: str = ""):
+        self.success = success
+        self.data = data
+        self.message = message
+
+class SearchTool:
+    def __init__(self, db):
+        self.repo = ProductRepository(db)
+
+    def search_products(self, tenant_id: int, query: str, limit:int=5) -> ToolResponse:
+        # naive search: name/description contains query; in prod use Elastic/Opensearch
+        rows = [p for p in self.repo.list_by_tenant(tenant_id) if query.lower() in (p.name + (p.description or "")).lower()]
+        return ToolResponse(True, data=[{"id": r.id, "name": r.name, "price": r.price, "quantity": r.quantity} for r in rows[:limit]])
+
+class CartTool:
+    # minimal placeholder - in prod maintain Cart model & DB
+    def __init__(self):
+        self.carts = {}  # ephemeral dict: user_id -> list of product ids
+
+    def add_item(self, user_id: int, product_id: int, qty: int = 1):
+        self.carts.setdefault(user_id, []).append({"product_id": product_id, "qty": qty})
+        return ToolResponse(True, data=self.carts[user_id], message="Added")
+
+class AgentManager:
+    def __init__(self, openai_api_key: str | None = None):
+        self.openai_api_key = openai_api_key or settings.OPENAI_API_KEY
+        self.cart_tool = CartTool()
+        # tools requiring DB will be created per-request
+
+    async def call_llm(self, prompt: str) -> str:
+        # Minimal OpenAI API usage using httpx; replace with actual OpenAI sdk
+        if not self.openai_api_key:
+            # fallback simple deterministic heuristic
+            return json.dumps({"plan": [{"action": "search", "query": "budget smartphone under 20000"}]})
+        headers = {"Authorization": f"Bearer {self.openai_api_key}"}
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post("https://api.openai.com/v1/chat/completions", json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role":"user","content":prompt}],
+                "max_tokens": 400,
+                "temperature": 0.2
+            }, headers=headers)
+            resp.raise_for_status()
+            j = resp.json()
+            return j["choices"][0]["message"]["content"]
+
+    async def handle_instruction(self, tenant_id: int, user_id: int, instruction: str):
+        # 1. gather context (e.g. recent orders, cart, top products)
+        db = SessionLocal()
+        try:
+            repo = ProductRepository(db)
+            top_products = repo.list_by_tenant(tenant_id, limit=10)
+            context = {
+                "user_id": user_id,
+                "tenant_id": tenant_id,
+                "top_products": [{"id":p.id,"name":p.name,"price":p.price,"qty":p.quantity} for p in top_products]
+            }
+        finally:
+            db.close()
+
+        # 2. create LLM prompt
+        prompt = f"""You are an action planning assistant for an e-commerce platform. The user instruction: {instruction}
+Return a JSON object {"{"}"plan":[{{"action":"<search|add_to_cart|checkout|recommend>","params":{{}}}}]{"}"} and nothing else.
+Context: {json.dumps(context)}"""
+        llm_out = await self.call_llm(prompt)
+        # 3. parse LLM output to plan
+        try:
+            parsed = json.loads(llm_out)
+            plan = parsed.get("plan", [])
+        except Exception:
+            # fallback: assume LLM returned free text - do a naive parse
+            plan = [{"action":"search","params":{"query":instruction}}]
+
+        # 4. execute plan
+        results = []
+        db = SessionLocal()
+        search_tool = SearchTool(db)
+        for step in plan:
+            action = step.get("action")
+            params = step.get("params", {})
+            if action == "search":
+                q = params.get("query") or instruction
+                r = search_tool.search_products(tenant_id, q)
+                results.append({"action":"search","result":r.data})
+            elif action == "add_to_cart":
+                pid = params.get("product_id")
+                qty = params.get("qty",1)
+                r = self.cart_tool.add_item(user_id, pid, qty)
+                results.append({"action":"add_to_cart","result":r.data})
+            elif action == "recommend":
+                # produce simple heuristic: top 3 in top_products
+                results.append({"action":"recommend","result":context["top_products"][:3]})
+            else:
+                results.append({"action":"noop","message":"unknown action"})
+        return {"plan": plan, "results": results}
+```
+
+**Explanation (AgentManager)**:
+
+* The `AgentManager` composes context, sends a constrained prompt to the LLM to produce a structured plan (JSON).
+* It maps plan steps to tool adapters (`SearchTool`, `CartTool`) and executes them.
+* **Important**: In production you must validate LLM plan outputs, implement safety checks, rate limits, and a robust tool interface so LLM can’t call arbitrary endpoints.
+
+---
+
+## `backend/app/main.py`
+
+```python
+# main.py
+from fastapi import FastAPI
+from app.api.products import router as products_router
+from app.db.session import Base, engine
+from app.models import user, product, tenant, order  # import to register models
+
+app = FastAPI(title="Agentic Ecom SaaS (example)")
+Base.metadata.create_all(bind=engine)
+
+app.include_router(products_router)
+```
+
+Start server:
+
+```bash
+export DATABASE_URL=postgresql+psycopg2://postgres:password@localhost:5432/ecom
+uvicorn app.main:app --reload --port 8000
+```
+
+---
+
+# 4 — Frontend — React (single-file examples)
+
+Files:
+
+* `frontend/src/App.jsx` — root with routing
+* `frontend/src/components/ProductList.jsx` — responsive product grid
+* `frontend/src/components/AgentChat.jsx` — agent chat UI (WebSocket or HTTP)
+
+Prereqs: create-react-app or Vite, Tailwind configured. I’ll show two components.
+
+## `frontend/src/components/ProductList.jsx`
+
+```jsx
+// ProductList.jsx
+import React, { useEffect, useState } from "react";
+
+export default function ProductList({ tenantId }) {
+  const [products, setProducts] = useState([]);
+
+  useEffect(() => {
+    async function load() {
+      const res = await fetch(`/api/products?X-Tenant-Id=${tenantId}`, {
+        headers: { "X-Tenant-Id": tenantId }
+      });
+      const data = await res.json();
+      setProducts(data);
+    }
+    load();
+  }, [tenantId]);
+
+  return (
+    <div className="container mx-auto p-4">
+      <h1 className="text-2xl font-semibold mb-4">Electronics</h1>
+      <div className="grid gap-4 grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
+        {products.map(p => (
+          <div key={p.id} className="border rounded-lg p-4 shadow-sm">
+            <div className="h-40 bg-gray-100 mb-3 flex items-center justify-center">Image</div>
+            <h2 className="font-medium">{p.name}</h2>
+            <p className="text-sm text-gray-600">{p.description}</p>
+            <div className="mt-2 flex items-center justify-between">
+              <span className="font-bold">₹{p.price}</span>
+              <button className="px-3 py-1 bg-blue-600 text-white rounded" onClick={() => {
+                // add to cart via API
+                fetch("/api/cart/add", {method:"POST", headers:{"Content-Type":"application/json","X-Tenant-Id":tenantId}, body: JSON.stringify({product_id: p.id, qty: 1})})
+                .then(()=> alert("Added to cart"))
+              }}>Add</button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+## `frontend/src/components/AgentChat.jsx`
+
+```jsx
+// AgentChat.jsx
+import React, { useState } from "react";
+
+export default function AgentChat({ tenantId, userId }) {
+  const [messages, setMessages] = useState([]);
+  const [text, setText] = useState("");
+
+  async function send() {
+    if (!text) return;
+    const userMsg = {role:"user", text};
+    setMessages(prev=>[...prev,userMsg]);
+    setText("");
+    // call backend agent endpoint
+    const res = await fetch("/api/agent/act", {
+      method: "POST",
+      headers: {"Content-Type":"application/json", "X-Tenant-Id": tenantId},
+      body: JSON.stringify({instruction: text, user_id: userId})
+    });
+    const j = await res.json();
+    setMessages(prev=>[...prev, {role:"agent", text: JSON.stringify(j.results, null, 2)}]);
+  }
+
+  return (
+    <div className="w-full max-w-md border rounded p-3">
+      <div className="h-64 overflow-auto bg-white p-2">
+        {messages.map((m,i)=>
+          <div key={i} className={m.role==="user"?"text-right":"text-left"}>
+            <pre className="inline-block bg-gray-100 p-2 rounded">{m.text}</pre>
+          </div>
+        )}
+      </div>
+      <div className="mt-2 flex">
+        <input className="flex-1 p-2 border rounded" value={text} onChange={e=>setText(e.target.value)} placeholder="Ask agent — e.g. recommend budget phones"/>
+        <button className="ml-2 px-3 py-2 bg-indigo-600 text-white rounded" onClick={send}>Send</button>
+      </div>
+    </div>
+  );
+}
+```
+
+**Note**: Frontend hits routes `/api/...`. Use a reverse proxy (Nginx) or set `proxy` in dev.
+
+---
+
+# 5 — Multi-tenant & SaaS considerations
+
+* **Tenant identification**: Use tenant subdomain (`tenant1.app.com`) or header `X-Tenant-Id`. For quick dev use header; for production prefer subdomain and middleware to map tenant.
+* **Billing & plans**: Connect Stripe. Use Stripe Products for plan tiers; implement feature flags per tenant (e.g., agent credits, usage quotas).
+* **Data isolation**: For scale/strong isolation use schema-per-tenant or separate DBs; for simpler multi-tenant keep `tenant_id` on all tables with row-level security.
+* **Scaling agents**: Agent tasks can be CPU/Network heavy. Move to background workers (Celery + Redis), and put an audit record `AgentTask` with plan & step logs.
+
+---
+
+# 6 — Security & production hardening
+
+* Use HTTPS and secure cookies.
+* Hash passwords with Argon2/Bcrypt.
+* Use RBAC (admin/user) with JWT with short expiration, refresh tokens.
+* Validate LLM outputs and sanitize tool inputs. Never allow model to specify arbitrary URLs or exec commands.
+* Rate limit agent endpoints and implement credit-based throttling.
+
+---
+
+# 7 — Developer workflow & run instructions (minimal local)
+
+1. Create `.env` with DB URL and keys.
+2. Start PostgreSQL.
+3. `pip install -r requirements.txt` (include packages above).
+4. Create DB and run `uvicorn app.main:app --reload`.
+5. Start React app: `npm run dev` (Vite) or `npm start` (CRA).
+6. Seed tenants/products via `/products` API using header `X-Tenant-Id: 1`.
+
+---
+
+# 8 — Example: How agent flow looks in practice
+
+User: “Find a budget smartphone with good battery and add one to my cart.”
+
+1. Frontend sends instruction to `/api/agent/act`.
+2. AgentManager builds context (top products, inventory, user history) and asks LLM to produce a plan like:
+
+```json
+{"plan":[{"action":"search","params":{"query":"budget smartphone good battery under 20000"}},{"action":"add_to_cart","params":{"product_id":123,"qty":1}}]}
+```
+
+3. Backend executes `search`, returns top matches. Agent chooses product\_id 123 and calls `CartTool.add_item`.
+4. Backend returns an execution trace to user with friendly text and links to checkout.
+
+---
+
+# 9 — Production enhancements & scaling roadmap (next items to implement)
+
+* Integrate vector DB + semantic product embeddings for better recommendations (OpenAI embeddings + Pinecone/FAISS).
+* Add elasticsearch for faceted search.
+* Add a robust agent framework (LangChain) with tool adapters and an Action Registry.
+* Add background worker (Celery/RQ) for long tasks and webhook callbacks for Stripe events.
+* Add instrumentation (Prometheus, Grafana) and structured logs for agent decisions.
+* Add A/B testing for agent suggestions and analytics for conversion.
+
+---
+
+# 10 — Quick checklist & file map to create repo
+
+```
+/backend
+  /app
+    main.py
+    core/config.py
+    db/session.py
+    models/*.py
+    schemas/*.py
+    repositories/*.py
+    services/*.py
+    api/products.py
+    agents/agent_manager.py
+Dockerfile
+requirements.txt
+
+/frontend
+  src/App.jsx
+  src/components/ProductList.jsx
+  src/components/AgentChat.jsx
+  tailwind.config.js
+  package.json
+docker-compose.yml
+README.md
+```
+
+---
+
+# 11 — Example Dockerfile (backend)
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY ./backend/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+COPY ./backend /app
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+---
+
+# 12 — Final notes, safety & next steps
+
+* This implementation is **a starting blueprint**: agentic systems must include safety layers — validate LLM outputs, enforce allowed tool/actions, and implement auditing.
+* If you want, I can:
+
+  * Generate a full repo tree (zipped) with these files ready to run locally.
+  * Expand the agent manager to use LangChain + OpenAI with example prompts and unit tests.
+  * Provide a full React single-page app (Vite) with auth, checkout, and Stripe integration end-to-end.
+
+Which of the above do you want next? (repo zip, LangChain agent implementation, Stripe + Checkout integration, or full frontend + CI config?)
