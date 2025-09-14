@@ -1,0 +1,77 @@
+Object-Relational Mapping (ORM) in Python projects involves using a library or framework to bridge the gap between object-oriented Python code and relational databases. This allows developers to interact with database tables as if they were Python objects, abstracting away the need to write raw SQL queries. 
+Here's how ORM is typically done in Python projects: 
+
+• Choosing an ORM Library: 
+	• Django ORM: Tightly integrated with the Django web framework, it's a popular choice for Django projects. 
+	• SQLAlchemy: A powerful and flexible ORM that can be used with any Python project, offering both a high-level ORM and a low-level SQL Expression Language. 
+	• Pony ORM: Known for its expressive query syntax and concise model definitions. 
+	• Tortoise ORM: An asynchronous ORM designed for use with async web frameworks like FastAPI and Sanic. 
+
+• Defining Models: 
+	• You define Python classes that represent your database tables. These classes are often called "models." 
+	• Each attribute of the model class typically maps to a column in the corresponding database table. 
+	• The ORM handles the mapping of data types between Python and the database. 
+
+    # Example with SQLAlchemy
+    from sqlalchemy import Column, Integer, String
+    from sqlalchemy.ext.declarative import declarative_base
+
+    Base = declarative_base()
+
+    class User(Base):
+        __tablename__ = 'users'
+        id = Column(Integer, primary_key=True)
+        name = Column(String)
+        email = Column(String)
+
+• Connecting to the Database: 
+	• You configure the ORM to connect to your chosen database (e.g., PostgreSQL, MySQL, SQLite). This involves specifying connection details like the database URL, username, and password. 
+
+    # Example with SQLAlchemy
+    from sqlalchemy import create_engine
+    engine = create_engine('sqlite:///example.db')
+    Base.metadata.create_all(engine) # Creates tables if they don't exist
+
+• Performing CRUD Operations: 
+	• Create: Instantiate model objects and add them to the ORM session for persistence. 
+	• Read: Use ORM methods (e.g., filter(), get(), all()) to query the database and retrieve objects based on criteria. 
+	• Update: Modify attributes of retrieved objects and commit the changes. 
+	• Delete: Delete objects from the database through the ORM. 
+
+    # Example with SQLAlchemy
+    from sqlalchemy.orm import sessionmaker
+
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    # Create
+    new_user = User(name='Alice', email='alice@example.com')
+    session.add(new_user)
+    session.commit()
+
+    # Read
+    users = session.query(User).filter_by(name='Alice').all()
+    for user in users:
+        print(f"User ID: {user.id}, Name: {user.name}")
+
+    # Update
+    user_to_update = session.query(User).filter_by(name='Alice').first()
+    if user_to_update:
+        user_to_update.email = 'alice.new@example.com'
+        session.commit()
+
+    # Delete
+    user_to_delete = session.query(User).filter_by(name='Alice').first()
+    if user_to_delete:
+        session.delete(user_to_delete)
+        session.commit()
+
+    session.close()
+
+• Managing Relationships: 
+	• ORMs provide ways to define relationships between models (e.g., one-to-many, many-to-many) and handle related data retrieval. 
+
+By using an ORM, Python developers can focus on object-oriented programming concepts rather than database-specific SQL syntax, making database interactions more intuitive and often more maintainable. 
+
+AI responses may include mistakes.
+
